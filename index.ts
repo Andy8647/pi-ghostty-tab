@@ -66,7 +66,11 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter()) {
 
 	function renderTitle(ctx: ExtensionContext): void {
 		if (!config.enabled || !ctx.hasUI) return;
-		ctx.ui.setTitle(currentTitle());
+		const title = currentTitle();
+		// Never push an empty title — leave the terminal's own (cwd) title in
+		// place until there is something worth showing.
+		if (!title) return;
+		ctx.ui.setTitle(title);
 	}
 
 	// ---- spinner + progress ----------------------------------------------
