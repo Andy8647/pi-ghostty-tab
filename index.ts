@@ -279,12 +279,17 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter()) {
 		lastCtx = ctx;
 		if (!ctx.hasUI) return;
 		startSpinner(ctx);
+		// Kick off summary generation immediately (parallel with the agent's
+		// work) so the title appears mid-first-turn instead of at agent_end.
+		void generateSummary(ctx);
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
 		lastCtx = ctx;
 		if (!ctx.hasUI) return;
 		stopSpinner(ctx);
+		// Fallback: retry here if the agent_start attempt failed or had no
+		// user messages yet.
 		void generateSummary(ctx);
 	});
 
