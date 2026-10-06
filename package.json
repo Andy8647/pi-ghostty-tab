@@ -1,0 +1,56 @@
+{
+  "name": "pi-ghostty-tab",
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@11.10.0",
+  "description": "Slot-configurable Ghostty tab title for pi coding agent — braille spinner, LLM session summary, tool tracking, native OSC 9;4 progress bar",
+  "license": "MIT",
+  "author": "Andy8647",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "ghostty",
+    "terminal",
+    "tab-title",
+    "progress-bar"
+  ],
+  "files": [
+    "*.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "./index.ts",
+  "types": "./index.ts",
+  "exports": {
+    ".": {
+      "types": "./index.ts",
+      "default": "./index.ts"
+    }
+  },
+  "scripts": {
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Andy8647/pi-ghostty-tab.git"
+  }
+}
