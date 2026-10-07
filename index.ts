@@ -13,6 +13,21 @@
 import path from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+	type Attention,
+	BEL,
+	DISABLE_FOCUS_REPORTING,
+	ENABLE_FOCUS_REPORTING,
+	FOCUS_IN,
+	FOCUS_OUT,
+	lastFocusEvent,
+	notificationBody,
+	notifySequence,
+	type RunOutcome,
+	runOutcome,
+	settleDecision,
+	statusGlyph,
+} from "./attention.ts";
 import { loadConfig, progressEnabled, type LoadedConfig } from "./config.ts";
 import { createTtyWriter, ProgressState, progressSequence, type WriteFn } from "./progress.ts";
 import { assistantText, buildSummaryUserPrompt, sanitizeSummary, SUMMARY_SYSTEM_PROMPT } from "./summary.ts";
@@ -21,13 +36,23 @@ import { composeTitle, type TitleState } from "./title.ts";
 const BRAILLE_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS = 80;
 const COMPLETION_FLASH_MS = 800;
+/** How long a red bar stays when the run failed while you were watching. */
+const ERROR_FLASH_MS = 3000;
+/** Re-send a held progress state so the terminal never times it out (pi core does the same, every 1s). */
+const PROGRESS_KEEPALIVE_MS = 5000;
+const TEST_DELAY_MS = 5000;
+/** Process-wide guard: the exit hook must be installed once even across /reload. */
+const EXIT_HOOK_KEY = Symbol.for("pi-ghostty-tab:focus-exit-hook");
 const SUMMARY_ENTRY_TYPE = "pi-ghostty-tab:summary";
 /** How many opening user messages (and how much of each) feed the summary call. */
 const SUMMARY_MAX_MESSAGES = 5;
 const SUMMARY_CHARS_PER_MESSAGE = 800;
 const SUMMARY_MAX_ATTEMPTS = 3;
 
-export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter()) {
+/** The slice of stdin the focus tap needs; injectable for tests. */
+export type FocusInput = Pick<NodeJS.ReadStream, "isTTY" | "on" | "off">;
+
+export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), input: FocusInput = process.stdin) {
 	const loaded: LoadedConfig = loadConfig();
 	const { config } = loaded;
 	const progressOn = progressEnabled(loaded);
@@ -46,11 +71,29 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter()) {
 	let summaryAttempts = 0;
 	let summaryInFlight = false;
 
+	// Attention state. `focused` starts true: pi was just launched from this tab.
+	let focused = true;
+	let attention: Attention | undefined;
+	let promptTitle: string | undefined;
+	/** Spans agent_start → agent_settled, i.e. across retries and auto-compaction. */
+	let runActive = false;
+	let runStartedAt = 0;
+	let lastOutcome: RunOutcome = "completed";
+	/** The current agent run's abort signal, captured at agent_start (each retry gets a new one). */
+	let runSignal: AbortSignal | undefined;
+	let progressKeepalive: ReturnType<typeof setInterval> | undefined;
+	/** The red bar is held until the tab is focused. */
+	let errorHeld = false;
+	let detachFocus: (() => void) | undefined;
+	/** Whether the tab currently shows a title we composed (vs. pi's own). */
+	let titlePushed = false;
+
 	// ---- title rendering ------------------------------------------------
 
 	function titleState(): TitleState {
 		return {
-			spinnerFrame: isWorking ? BRAILLE_FRAMES[frameIndex % BRAILLE_FRAMES.length] : undefined,
+			status: statusGlyph(attention),
+			spinnerFrame: isWorking && attention !== "waiting" ? BRAILLE_FRAMES[frameIndex % BRAILLE_FRAMES.length] : undefined,
 			icon: "π",
 			dir: path.basename(cwd),
 			session: sessionName,
@@ -67,25 +110,57 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter()) {
 	function renderTitle(ctx: ExtensionContext): void {
 		if (!config.enabled || !ctx.hasUI) return;
 		const title = currentTitle();
-		// Never push an empty title — leave the terminal's own (cwd) title in
-		// place until there is something worth showing.
-		if (!title) return;
-		ctx.ui.setTitle(title);
+		if (title) {
+			titlePushed = true;
+			ctx.ui.setTitle(title);
+			return;
+		}
+		// Never blank the tab. Before our first title, pi's own title stays put;
+		// after it (a ✓ that just cleared, say), put pi's default back so the
+		// stale one does not linger.
+		if (titlePushed) {
+			titlePushed = false;
+			ctx.ui.setTitle(sessionName ? `π - ${sessionName} - ${path.basename(cwd)}` : `π - ${path.basename(cwd)}`);
+		}
 	}
 
-	// ---- spinner + progress ----------------------------------------------
+	// ---- progress bar ------------------------------------------------------
+
+	function clearProgressTimers(): void {
+		if (progressKeepalive) clearInterval(progressKeepalive);
+		if (completionTimer) clearTimeout(completionTimer);
+		progressKeepalive = undefined;
+		completionTimer = undefined;
+		errorHeld = false;
+	}
+
+	/** Every progress write goes through here, so a newer state always cancels pending flashes. */
+	function setProgress(state: number, value?: number): void {
+		if (!progressOn) return;
+		clearProgressTimers();
+		const seq = progressSequence(state, value);
+		write(seq);
+		if (state !== ProgressState.Clear) {
+			progressKeepalive = setInterval(() => write(seq), PROGRESS_KEEPALIVE_MS);
+		}
+	}
+
+	function flashProgress(state: number, durationMs: number): void {
+		if (!progressOn) return;
+		setProgress(state, 100);
+		completionTimer = setTimeout(() => setProgress(ProgressState.Clear), durationMs);
+	}
+
+	// ---- spinner -----------------------------------------------------------
 
 	function startSpinner(ctx: ExtensionContext): void {
 		if (spinnerTimer) clearInterval(spinnerTimer);
-		if (completionTimer) {
-			clearTimeout(completionTimer);
-			completionTimer = undefined;
-		}
 		isWorking = true;
 		currentTool = undefined;
 		frameIndex = 0;
-		if (progressOn) write(progressSequence(ProgressState.Indeterminate));
 		spinnerTimer = setInterval(() => {
+			// A waiting tab shows ⏸ instead of a spinner; nothing to animate.
+			if (attention === "waiting") return;
 			frameIndex++;
 			renderTitle(ctx);
 		}, SPINNER_INTERVAL_MS);
@@ -98,14 +173,87 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter()) {
 			clearInterval(spinnerTimer);
 			spinnerTimer = undefined;
 		}
-		if (progressOn) {
-			write(progressSequence(ProgressState.Set, 100));
-			completionTimer = setTimeout(() => {
-				write(progressSequence(ProgressState.Clear));
-				completionTimer = undefined;
-			}, COMPLETION_FLASH_MS);
+		renderTitle(ctx);
+	}
+
+	// ---- attention ---------------------------------------------------------
+
+	function notifyTitle(): string {
+		return summary || sessionName || `pi · ${path.basename(cwd)}`;
+	}
+
+	/** Bell + desktop notification. Neither moves focus: the bell bounces the Dock icon and marks the tab with 🔔. */
+	function ring(kind: Attention, detail: { elapsedMs?: number; promptTitle?: string }): void {
+		if (config.bell) write(BEL);
+		if (config.notify) write(notifySequence(notifyTitle(), notificationBody(kind, detail)));
+	}
+
+	function onRunSettled(ctx: ExtensionContext): void {
+		const elapsedMs = Date.now() - runStartedAt;
+		const decision = settleDecision(lastOutcome, focused, elapsedMs, config.notifyAfterSeconds * 1000);
+		attention = decision.attention;
+		if (decision.signal && attention) ring(attention, { elapsedMs });
+
+		if (lastOutcome === "completed") {
+			flashProgress(ProgressState.Set, COMPLETION_FLASH_MS);
+		} else if (lastOutcome === "error") {
+			if (focused) {
+				flashProgress(ProgressState.Error, ERROR_FLASH_MS);
+			} else {
+				setProgress(ProgressState.Error, 100);
+				errorHeld = true;
+			}
+		} else {
+			setProgress(ProgressState.Clear);
 		}
 		renderTitle(ctx);
+	}
+
+	function onFocusChange(isFocused: boolean): void {
+		if (focused === isFocused) return;
+		focused = isFocused;
+		if (!isFocused) return;
+		// Coming back to the tab is what "seen" means.
+		if (errorHeld) setProgress(ProgressState.Clear);
+		if (attention === "done" || attention === "error") {
+			attention = undefined;
+			if (lastCtx) renderTitle(lastCtx);
+		}
+	}
+
+	/**
+	 * Focus events are read by tapping stdin directly: in fullscreen mode pi's
+	 * own viewport listener is registered before any extension and consumes
+	 * FOCUS_IN/FOCUS_OUT, so `onTerminalInput` never sees them. The tap only
+	 * listens; pi keeps reading stdin as before.
+	 *
+	 * Regular mode does not enable focus reporting, so we turn it on and
+	 * swallow the two sequences before they reach the editor.
+	 */
+	function attachFocus(ctx: ExtensionContext): void {
+		detachFocus?.();
+		if (!input.isTTY) return;
+		const tap = (chunk: string | Buffer) => {
+			const event = lastFocusEvent(typeof chunk === "string" ? chunk : chunk.toString("latin1"));
+			if (event !== undefined) onFocusChange(event);
+		};
+		input.on("data", tap);
+		const unsubscribe = ctx.ui.onTerminalInput((data) =>
+			data === FOCUS_IN || data === FOCUS_OUT ? { consume: true } : undefined,
+		);
+		write(ENABLE_FOCUS_REPORTING);
+		const globals = globalThis as Record<symbol, unknown>;
+		if (!globals[EXIT_HOOK_KEY]) {
+			globals[EXIT_HOOK_KEY] = true;
+			// Leave the shell as we found it. Harmless in fullscreen mode, where
+			// pi has already turned it off along with mouse tracking.
+			process.once("exit", () => write(DISABLE_FOCUS_REPORTING));
+		}
+		detachFocus = () => {
+			input.off("data", tap);
+			unsubscribe();
+			detachFocus = undefined;
+		};
 	}
 
 	// ---- summary ----------------------------------------------------------
@@ -203,12 +351,13 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter()) {
 	// ---- /tab command -----------------------------------------------------
 
 	pi.registerCommand("tab", {
-		description: "Terminal tab title: /tab shows status, /tab set <text> sets the summary, /tab clear, /tab regen",
+		description: "Terminal tab title: /tab shows status, /tab set <text> sets the summary, /tab clear, /tab regen, /tab test",
 		getArgumentCompletions: (prefix) => {
 			const args = [
 				{ value: "set", label: "set <text>", description: "Set the tab summary manually" },
 				{ value: "clear", label: "clear", description: "Remove the summary (slot falls back away)" },
 				{ value: "regen", label: "regen", description: "Regenerate the summary with the current model" },
+				{ value: "test", label: "test", description: "Open a prompt in 5s — switch tabs to see the bell and notification" },
 			];
 			return args.filter((a) => a.value.startsWith(prefix));
 		},
@@ -217,9 +366,29 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter()) {
 			const input = args.trim();
 			if (!input) {
 				ctx.ui.notify(
-					`title: "${currentTitle() || "(empty)"}"\nslots: ${config.slots.join(", ")}\nsummary: ${summary ?? "(none)"}\nprogress: ${config.progress}${config.progress === "auto" ? (progressOn ? " (auto: ours)" : " (auto: pi core)") : ""}`,
+					[
+						`title: "${currentTitle() || "(empty)"}"`,
+						`slots: ${config.slots.join(", ")}`,
+						`summary: ${summary ?? "(none)"}`,
+						`progress: ${config.progress}${config.progress === "auto" ? (progressOn ? " (auto: ours)" : " (auto: pi core)") : ""}`,
+						`attention: ${attention ?? "(none)"} · focused: ${focused} · tracking: ${detachFocus ? "on" : "off"}`,
+						`bell: ${config.bell} · notify: ${config.notify} · notifyAfterSeconds: ${config.notifyAfterSeconds}`,
+					].join("\n"),
 					"info",
 				);
+				return;
+			}
+			if (input === "test") {
+				ctx.ui.notify(`Switch to another tab now — a prompt opens in ${TEST_DELAY_MS / 1000}s.`, "info");
+				const sessionFile = ctx.sessionManager.getSessionFile();
+				setTimeout(() => {
+					if (!lastCtx || lastCtx.sessionManager.getSessionFile() !== sessionFile) return;
+					const testCtx = lastCtx;
+					void testCtx.ui
+						.confirm("pi-ghostty-tab test", "This prompt is the test. Did the bell and notification arrive while you were away?")
+						.then((ok) => testCtx.ui.notify(ok ? "Attention signals work." : "Check Ghostty's notification permission and bell-features.", ok ? "info" : "warning"))
+						.catch(() => {});
+				}, TEST_DELAY_MS);
 				return;
 			}
 			if (input === "clear") {
@@ -260,7 +429,9 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter()) {
 		cwd = ctx.cwd;
 		summary = undefined;
 		summaryAttempts = 0;
+		attention = undefined;
 		restoreSummary(ctx);
+		attachFocus(ctx);
 		renderTitle(ctx);
 		if (!warningsNotified && loaded.warnings.length > 0) {
 			warningsNotified = true;
@@ -282,19 +453,63 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter()) {
 	pi.on("agent_start", async (_event, ctx) => {
 		lastCtx = ctx;
 		if (!ctx.hasUI) return;
+		// agent_start repeats within one run (retries, auto-compaction); only
+		// the first one starts the clock.
+		if (!runActive) {
+			runActive = true;
+			runStartedAt = Date.now();
+			lastOutcome = "completed";
+		}
+		runSignal = ctx.signal;
+		// A new run makes old ✓/✗ marks stale; a still-open prompt keeps ⏸.
+		if (attention !== "waiting") attention = undefined;
+		// An external editor or ctrl+z may have reset focus reporting.
+		if (detachFocus) write(ENABLE_FOCUS_REPORTING);
+		if (attention !== "waiting") setProgress(ProgressState.Indeterminate);
 		startSpinner(ctx);
 		// Kick off summary generation immediately (parallel with the agent's
 		// work) so the title appears mid-first-turn instead of at agent_end.
 		void generateSummary(ctx);
 	});
 
-	pi.on("agent_end", async (_event, ctx) => {
+	pi.on("agent_end", async (event, ctx) => {
 		lastCtx = ctx;
 		if (!ctx.hasUI) return;
+		lastOutcome = runOutcome(event.messages, runSignal?.aborted === true);
 		stopSpinner(ctx);
 		// Fallback: retry here if the agent_start attempt failed or had no
 		// user messages yet.
 		void generateSummary(ctx);
+	});
+
+	// Fired once no retry, compaction or queued message will continue the
+	// run — the only point where "done" is actually done.
+	pi.on("agent_settled", async (_event, ctx) => {
+		lastCtx = ctx;
+		if (!ctx.hasUI || !runActive) return;
+		runActive = false;
+		onRunSettled(ctx);
+	});
+
+	// Any blocking extension prompt (permission asks, selects, inputs). pi
+	// emits these for the outermost prompt only.
+	pi.on("ui_prompt_start", async (event, ctx) => {
+		lastCtx = ctx;
+		if (!ctx.hasUI) return;
+		attention = "waiting";
+		promptTitle = event.title;
+		if (runActive) setProgress(ProgressState.Paused);
+		if (!focused) ring("waiting", { promptTitle });
+		renderTitle(ctx);
+	});
+
+	pi.on("ui_prompt_end", async (_event, ctx) => {
+		lastCtx = ctx;
+		if (!ctx.hasUI || attention !== "waiting") return;
+		attention = undefined;
+		promptTitle = undefined;
+		if (runActive) setProgress(ProgressState.Indeterminate);
+		renderTitle(ctx);
 	});
 
 	pi.on("tool_execution_start", async (event, _ctx) => {
@@ -307,9 +522,10 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter()) {
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
 		if (spinnerTimer) clearInterval(spinnerTimer);
-		if (completionTimer) clearTimeout(completionTimer);
 		spinnerTimer = undefined;
-		completionTimer = undefined;
-		if (progressOn) write(progressSequence(ProgressState.Clear));
+		detachFocus?.();
+		if (progressOn) setProgress(ProgressState.Clear);
+		runActive = false;
+		attention = undefined;
 	});
 }

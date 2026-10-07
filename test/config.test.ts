@@ -86,3 +86,30 @@ describe("progressEnabled", () => {
 		assert.equal(progressEnabled(parseConfig({})), true);
 	});
 });
+
+describe("attention config", () => {
+	it("defaults: bell + notify on, 20s threshold, status slot first", () => {
+		const { config } = parseConfig(undefined);
+		assert.equal(config.bell, true);
+		assert.equal(config.notify, true);
+		assert.equal(config.notifyAfterSeconds, 20);
+		assert.equal(config.slots[0], "status");
+	});
+
+	it("accepts valid values", () => {
+		const { config, warnings } = parseConfig({ ghosttyTab: { bell: false, notify: false, notifyAfterSeconds: 0, slots: ["status", "summary"] } });
+		assert.equal(config.bell, false);
+		assert.equal(config.notify, false);
+		assert.equal(config.notifyAfterSeconds, 0);
+		assert.deepEqual(config.slots, ["status", "summary"]);
+		assert.equal(warnings.length, 0);
+	});
+
+	it("warns and defaults on invalid values", () => {
+		const { config, warnings } = parseConfig({ ghosttyTab: { bell: "yes", notify: 1, notifyAfterSeconds: -1 } });
+		assert.equal(config.bell, true);
+		assert.equal(config.notify, true);
+		assert.equal(config.notifyAfterSeconds, 20);
+		assert.equal(warnings.length, 3);
+	});
+});

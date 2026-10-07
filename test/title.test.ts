@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import { composeTitle, slotValue, type TitleState } from "../title.ts";
 
 const FULL_STATE: TitleState = {
+	status: "✓",
 	spinnerFrame: "⠹",
 	icon: "π",
 	dir: "pi",
@@ -14,6 +15,7 @@ const FULL_STATE: TitleState = {
 
 describe("slotValue", () => {
 	it("maps every slot to its state field", () => {
+		assert.equal(slotValue("status", FULL_STATE), "✓");
 		assert.equal(slotValue("spinner", FULL_STATE), "⠹");
 		assert.equal(slotValue("icon", FULL_STATE), "π");
 		assert.equal(slotValue("dir", FULL_STATE), "pi");

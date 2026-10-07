@@ -6,6 +6,8 @@
 import type { SlotName } from "./config.ts";
 
 export interface TitleState {
+	/** Attention glyph (⏸ waiting / ✓ done unseen / ✗ failed unseen); undefined when nothing is flagged. */
+	status?: string;
 	/** Current braille frame; undefined when the agent is idle. */
 	spinnerFrame?: string;
 	/** Static prefix icon ("π"). */
@@ -24,6 +26,8 @@ export interface TitleState {
 
 export function slotValue(slot: SlotName, state: TitleState): string | undefined {
 	switch (slot) {
+		case "status":
+			return state.status;
 		case "spinner":
 			return state.spinnerFrame;
 		case "icon":

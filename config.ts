@@ -7,7 +7,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-export const SLOT_NAMES = ["spinner", "icon", "dir", "session", "summary", "model", "tool"] as const;
+export const SLOT_NAMES = ["status", "spinner", "icon", "dir", "session", "summary", "model", "tool"] as const;
 export type SlotName = (typeof SLOT_NAMES)[number];
 
 export type ProgressMode = "auto" | "on" | "off";
@@ -27,9 +27,15 @@ export interface GhosttyTabConfig {
 	autoSummary: boolean;
 	/** Hard cap for generated/tool-set summaries. */
 	summaryMaxLength: number;
+	/** Ring the terminal bell when the tab needs you and is not focused. */
+	bell: boolean;
+	/** Post an OSC 777 desktop notification when the tab needs you and is not focused. */
+	notify: boolean;
+	/** A finished run only rings/notifies if it took at least this long. Errors and prompts always do. */
+	notifyAfterSeconds: number;
 }
 
-export const DEFAULT_SLOTS: SlotName[] = ["spinner", "icon", "dir", "session", "summary", "tool", "model"];
+export const DEFAULT_SLOTS: SlotName[] = ["status", "spinner", "icon", "dir", "session", "summary", "tool", "model"];
 
 const DEFAULTS: GhosttyTabConfig = {
 	enabled: true,
@@ -38,10 +44,14 @@ const DEFAULTS: GhosttyTabConfig = {
 	progress: "auto",
 	autoSummary: true,
 	summaryMaxLength: 40,
+	bell: true,
+	notify: true,
+	notifyAfterSeconds: 20,
 };
 
 const MIN_SUMMARY_LENGTH = 10;
 const MAX_SUMMARY_LENGTH = 120;
+const MAX_NOTIFY_AFTER_SECONDS = 3600;
 
 export interface LoadedConfig {
 	config: GhosttyTabConfig;
@@ -127,6 +137,23 @@ export function parseConfig(settings: unknown): LoadedConfig {
 			}
 		} else {
 			warnings.push(`ghosttyTab.summaryMaxLength: expected number, got ${typeof raw.summaryMaxLength} — using ${DEFAULTS.summaryMaxLength}`);
+		}
+	}
+
+	for (const key of ["bell", "notify"] as const) {
+		if (raw[key] === undefined) continue;
+		if (typeof raw[key] === "boolean") config[key] = raw[key];
+		else warnings.push(`ghosttyTab.${key}: expected boolean, got ${typeof raw[key]} — using ${DEFAULTS[key]}`);
+	}
+
+	if (raw.notifyAfterSeconds !== undefined) {
+		const value = raw.notifyAfterSeconds;
+		if (typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= MAX_NOTIFY_AFTER_SECONDS) {
+			config.notifyAfterSeconds = value;
+		} else {
+			warnings.push(
+				`ghosttyTab.notifyAfterSeconds: expected a number in 0..${MAX_NOTIFY_AFTER_SECONDS}, got ${JSON.stringify(value)} — using ${DEFAULTS.notifyAfterSeconds}`,
+			);
 		}
 	}
 
