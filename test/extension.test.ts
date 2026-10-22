@@ -25,7 +25,7 @@ function useSettings(settings: unknown): void {
 	process.env.PI_CODING_AGENT_DIR = dir;
 }
 
-async function harness(settings: unknown = {}) {
+async function harness(settings: unknown = {}, opts: { summary?: string } = {}) {
 	useSettings(settings);
 	const { default: extension } = await import("../index.ts");
 	const handlers = new Map<string, Handler[]>();
@@ -34,6 +34,7 @@ async function harness(settings: unknown = {}) {
 	const titles: string[] = [];
 	const notices: string[] = [];
 	const inputListeners: ((data: string) => unknown)[] = [];
+	const sessionEntries: unknown[] = [];
 	const stdin = Object.assign(new EventEmitter(), { isTTY: true });
 
 	const pi = {
@@ -46,7 +47,7 @@ async function harness(settings: unknown = {}) {
 	const ctx = {
 		hasUI: true,
 		cwd: "/work/proj",
-		model: undefined,
+		model: undefined as unknown,
 		signal: undefined as AbortSignal | undefined,
 		ui: {
 			setTitle: (t: string) => titles.push(t),
@@ -56,8 +57,21 @@ async function harness(settings: unknown = {}) {
 				return () => inputListeners.splice(inputListeners.indexOf(l), 1);
 			},
 		},
-		sessionManager: { getEntries: () => [], getSessionFile: () => "/s.jsonl" },
+		sessionManager: { getEntries: () => sessionEntries, getSessionFile: () => "/s.jsonl" },
+		modelRegistry: undefined as unknown,
 	};
+
+	// The nested summary call, faked: records every request, answers instantly.
+	const summaryRequests: { systemPrompt?: string; messages: { content: string }[] }[] = [];
+	if (opts.summary !== undefined) {
+		ctx.model = { id: "fake-model", provider: "fake", api: "fake", name: "fake", contextWindow: 1000, maxTokens: 100 };
+		ctx.modelRegistry = {
+			streamSimple: (_model: unknown, request: { systemPrompt?: string; messages: { content: string }[] }) => {
+				summaryRequests.push(request);
+				return { result: async () => ({ stopReason: "stop", content: [{ type: "text", text: opts.summary }] }) };
+			},
+		};
+	}
 
 	extension(pi as any, (seq: string) => writes.push(seq), stdin as any);
 
@@ -70,7 +84,9 @@ async function harness(settings: unknown = {}) {
 		await emit("agent_settled");
 	};
 	const lastTitle = () => titles.at(-1);
-	return { emit, run, writes, titles, lastTitle, stdin, inputListeners, commands, notices, ctx };
+	/** Let the fire-and-forget summary promise settle. */
+	const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+	return { emit, run, writes, titles, lastTitle, stdin, inputListeners, commands, notices, ctx, summaryRequests, flush, sessionEntries };
 }
 
 const BASE = { ghosttyTab: { slots: ["status", "spinner", "dir"], progress: "on", notifyAfterSeconds: 0 } };
@@ -253,5 +269,78 @@ describe("attention config", () => {
 		await h.emit("session_shutdown");
 		assert.equal(h.stdin.listenerCount("data"), 0);
 		assert.equal(h.inputListeners.length, 0);
+	});
+});
+
+describe("session summary timing", () => {
+	const SLOTS = { ghosttyTab: { slots: ["summary"], progress: "off" } };
+
+	it("asks for the title when the first user message starts, before the run finishes", async () => {
+		const h = await harness(SLOTS, { summary: "Fix the login bug" });
+		try {
+			await h.emit("session_start");
+			await h.emit("agent_start");
+			await h.flush();
+			assert.equal(h.summaryRequests.length, 0, "agent_start alone has no prompt text to summarize");
+
+			await h.emit("message_start", {
+				message: { role: "user", content: [{ type: "text", text: "please fix the login bug" }] },
+			});
+			await h.flush();
+			assert.equal(h.summaryRequests.length, 1);
+			assert.match(h.summaryRequests[0]!.messages.at(-1)!.content, /please fix the login bug/);
+			assert.equal(h.lastTitle(), "Fix the login bug", "title is already up mid-run");
+		} finally {
+			// The spinner interval started by agent_start would otherwise keep the
+			// test process alive (and a failed assertion would look like a hang).
+			await h.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+			await h.emit("agent_settled");
+			await h.emit("session_shutdown");
+		}
+	});
+
+	it("summarizes plain-string user content too", async () => {
+		const h = await harness(SLOTS, { summary: "Login 修复" });
+		await h.emit("message_start", { message: { role: "user", content: "修一下登录" } });
+		await h.flush();
+		assert.match(h.summaryRequests[0]!.messages.at(-1)!.content, /修一下登录/);
+		assert.equal(h.lastTitle(), "Login 修复");
+	});
+
+	it("keeps earlier messages from the session alongside the pending one", async () => {
+		const h = await harness(SLOTS, { summary: "Second topic" });
+		h.sessionEntries.push({ type: "message", message: { role: "user", content: "first question" } });
+		await h.emit("message_start", { message: { role: "user", content: "second question" } });
+		await h.flush();
+		const prompt = h.summaryRequests[0]!.messages.at(-1)!.content;
+		assert.match(prompt, /first question/);
+		assert.match(prompt, /second question/);
+	});
+
+	it("does not re-request once a summary exists", async () => {
+		const h = await harness(SLOTS, { summary: "Fix the login bug" });
+		await h.emit("message_start", { message: { role: "user", content: "fix login" } });
+		await h.flush();
+		await h.emit("message_start", { message: { role: "user", content: "another thing" } });
+		await h.flush();
+		await h.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+		await h.flush();
+		assert.equal(h.summaryRequests.length, 1);
+	});
+
+	it("ignores assistant and tool messages", async () => {
+		const h = await harness(SLOTS, { summary: "X" });
+		await h.emit("message_start", { message: { role: "assistant", content: [{ type: "text", text: "hi" }] } });
+		await h.flush();
+		assert.equal(h.summaryRequests.length, 0);
+	});
+
+	it("still falls back to agent_end when no user message start was seen", async () => {
+		const h = await harness(SLOTS, { summary: "Recovered title" });
+		h.sessionEntries.push({ type: "message", message: { role: "user", content: "fix login" } });
+		await h.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+		await h.flush();
+		assert.equal(h.summaryRequests.length, 1);
+		assert.equal(h.lastTitle(), "Recovered title");
 	});
 });

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-22
+
+### Fixed
+
+- The automatic summary now fires when the first user message starts, instead of at `agent_start`. pi emits extension events before it appends the prompt to the session, so at `agent_start` there was no user text yet and the call returned without even counting an attempt; the title then only showed up at the `agent_end` fallback, i.e. once the first run was basically over. The prompt text is now passed to the summary call directly, and `agent_end` stays as the fallback for runs that start without a visible user message.
+
 ## [0.2.0] - 2026-10-07
 
 ### Added
@@ -28,6 +34,7 @@ Initial release.
 - Session summary three ways: automatic nested model call after the first turn (strict 2–6 word / ≤40 char prompt + sanitizing), the `set_session_summary` tool for the LLM, and `/tab set|clear|regen` for the user; persisted via `pi.appendEntry` so it survives resume
 - OSC 9;4 native progress bar with `progress: "auto" | "on" | "off"` — auto yields to pi core's `terminal.showTerminalProgress`
 
-[Unreleased]: https://github.com/Andy8647/pi-ghostty-tab/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Andy8647/pi-ghostty-tab/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/Andy8647/pi-ghostty-tab/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Andy8647/pi-ghostty-tab/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Andy8647/pi-ghostty-tab/releases/tag/v0.1.0

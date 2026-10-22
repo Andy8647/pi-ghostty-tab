@@ -278,33 +278,49 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), i
 		}
 	}
 
-	function collectUserTexts(ctx: ExtensionContext): string[] {
+	/** Flatten a user message's content into prompt-ready text. */
+	function userMessageText(content: unknown): string {
+		const text =
+			typeof content === "string"
+				? content
+				: Array.isArray(content)
+					? content
+							.filter((block) => block?.type === "text" && typeof block.text === "string")
+							.map((block) => block.text as string)
+							.join("\n")
+					: "";
+		return text.trim();
+	}
+
+	/**
+	 * Opening user messages already persisted in the session.
+	 * `pending` is the message being appended right now: pi emits extension events
+	 * *before* it appends the entry, so at message_start it is not in here yet.
+	 */
+	function collectUserTexts(ctx: ExtensionContext, pending?: string): string[] {
 		const texts: string[] = [];
 		for (const entry of ctx.sessionManager.getEntries()) {
 			if (texts.length >= SUMMARY_MAX_MESSAGES) break;
 			if (entry.type !== "message") continue;
 			const message = entry.message;
 			if (message.role !== "user") continue;
-			const text =
-				typeof message.content === "string"
-					? message.content
-					: message.content
-							.filter((block) => block.type === "text")
-							.map((block) => (block as { text: string }).text)
-							.join("\n");
-			const trimmed = text.trim();
+			const trimmed = userMessageText(message.content);
 			if (trimmed) texts.push(trimmed.slice(0, SUMMARY_CHARS_PER_MESSAGE));
+		}
+		const trimmedPending = pending?.trim();
+		if (trimmedPending && !texts.includes(trimmedPending.slice(0, SUMMARY_CHARS_PER_MESSAGE))) {
+			texts.push(trimmedPending.slice(0, SUMMARY_CHARS_PER_MESSAGE));
 		}
 		return texts;
 	}
 
 	/** Fire-and-forget nested model call; never throws, never blocks the agent. */
-	async function generateSummary(ctx: ExtensionContext): Promise<void> {
+	async function generateSummary(ctx: ExtensionContext, pending?: string): Promise<void> {
 		if (!config.autoSummary || summary !== undefined || summaryInFlight) return;
 		if (summaryAttempts >= SUMMARY_MAX_ATTEMPTS) return;
 		const model = ctx.model;
 		if (!model) return;
-		const userTexts = collectUserTexts(ctx);
+		const userTexts = collectUserTexts(ctx, pending);
 		if (userTexts.length === 0) return;
 
 		summaryAttempts++;
@@ -467,9 +483,19 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), i
 		if (detachFocus) write(ENABLE_FOCUS_REPORTING);
 		if (attention !== "waiting") setProgress(ProgressState.Indeterminate);
 		startSpinner(ctx);
-		// Kick off summary generation immediately (parallel with the agent's
-		// work) so the title appears mid-first-turn instead of at agent_end.
-		void generateSummary(ctx);
+	});
+
+	// The first user message is the earliest point where the task text exists.
+	// agent_start is *too early*: pi emits extension events before it appends the
+	// prompt entry, so at agent_start the session has no user message yet and the
+	// summary call used to bail out silently. The title then only appeared at
+	// agent_end, i.e. once the first run was basically over. Hence: kick off here,
+	// with the prompt text passed in explicitly, in parallel with the agent's work.
+	pi.on("message_start", async (event, ctx) => {
+		if (event.message.role !== "user") return;
+		lastCtx = ctx;
+		if (!ctx.hasUI) return;
+		void generateSummary(ctx, userMessageText(event.message.content));
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
@@ -477,8 +503,8 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), i
 		if (!ctx.hasUI) return;
 		lastOutcome = runOutcome(event.messages, runSignal?.aborted === true);
 		stopSpinner(ctx);
-		// Fallback: retry here if the agent_start attempt failed or had no
-		// user messages yet.
+		// Fallback: retry here if the message_start attempt failed or the run
+		// started without a visible user message.
 		void generateSummary(ctx);
 	});
 
