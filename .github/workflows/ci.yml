@@ -41,6 +41,6 @@ jobs:
           TARBALL=$(ls /tmp/*pi-ghostty-tab-*.tgz | head -1)
           echo "packed: $TARBALL"
           tar -tzf "$TARBALL" | sort
-          for f in package/index.ts package/config.ts package/title.ts package/summary.ts package/progress.ts package/attention.ts package/README.md; do
+          for f in package/index.ts package/config.ts package/title.ts package/title-tap.ts package/summary.ts package/progress.ts package/attention.ts package/README.md; do
             tar -tzf "$TARBALL" | grep -qx "$f" || { echo "::error::$f missing from tarball"; exit 1; }
           done
