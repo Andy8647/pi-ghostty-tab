@@ -65,7 +65,7 @@ Three ways the `summary` slot gets filled, in priority order:
 2. **The LLM**: a `set_session_summary` tool it can call once it understands your task, and again if the topic changes.
 3. **Automatic**: after the first agent turn, the extension fires a small nested model call (your current model, off the main conversation) with a strict prompt — 2–6 words, ≤40 characters, no quotes/emoji/punctuation, your language. The result is sanitized again before it ever reaches your tab.
 
-The summary is persisted into the session file (`pi.appendEntry`), so it survives `/resume`.
+The summary is persisted into the session file (`pi.appendEntry`), so it survives `/resume`. pi core re-writes its own `π - <dir>` title right after extension startup and on every rename, so the extension watches terminal writes and takes its title back; that is also what keeps a resumed summary on screen instead of blinking away.
 
 Config:
 

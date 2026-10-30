@@ -1,6 +1,6 @@
 {
   "name": "pi-ghostty-tab",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "packageManager": "pnpm@11.10.0",
   "description": "Slot-configurable Ghostty tab title for pi coding agent — braille spinner, LLM session summary, tool tracking, native OSC 9;4 progress bar",
