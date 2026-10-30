@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-30
+
+### Fixed
+
+- A restored summary no longer disappears on `pi -c`. pi core writes its own `π - <dir>` title a few milliseconds *after* extension `session_start` handlers run, so the summary read back from the session file was overwritten before it could be seen (measured in a pty: ours at +570ms, core's at +578ms). Core also re-writes the title on every rename, and neither `terminal.*` settings nor an extension hook can turn that off. The extension now watches the writes it did not make and immediately puts its own title back (`title-tap.ts`), which also covers `/rename`, session switches and the Win32 package-update path.
+
 ## [0.2.1] - 2026-10-22
 
 ### Fixed
@@ -34,7 +40,8 @@ Initial release.
 - Session summary three ways: automatic nested model call after the first turn (strict 2–6 word / ≤40 char prompt + sanitizing), the `set_session_summary` tool for the LLM, and `/tab set|clear|regen` for the user; persisted via `pi.appendEntry` so it survives resume
 - OSC 9;4 native progress bar with `progress: "auto" | "on" | "off"` — auto yields to pi core's `terminal.showTerminalProgress`
 
-[Unreleased]: https://github.com/Andy8647/pi-ghostty-tab/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/Andy8647/pi-ghostty-tab/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/Andy8647/pi-ghostty-tab/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Andy8647/pi-ghostty-tab/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Andy8647/pi-ghostty-tab/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Andy8647/pi-ghostty-tab/releases/tag/v0.1.0

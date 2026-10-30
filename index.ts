@@ -32,6 +32,7 @@ import { loadConfig, progressEnabled, type LoadedConfig } from "./config.ts";
 import { createTtyWriter, ProgressState, progressSequence, type WriteFn } from "./progress.ts";
 import { assistantText, buildSummaryUserPrompt, sanitizeSummary, SUMMARY_SYSTEM_PROMPT } from "./summary.ts";
 import { composeTitle, type TitleState } from "./title.ts";
+import { installTitleTap, type TitleTapState } from "./title-tap.ts";
 
 const BRAILLE_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS = 80;
@@ -87,6 +88,17 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), i
 	let detachFocus: (() => void) | undefined;
 	/** Whether the tab currently shows a title we composed (vs. pi's own). */
 	let titlePushed = false;
+	let titleTapState: TitleTapState | undefined;
+
+	/**
+	 * pi core writes its own title right after binding extensions and on every
+	 * rename, so ours has to be taken back. Installed on first use: that path is
+	 * already gated on hasUI, which keeps the hook out of headless runs.
+	 */
+	function titleTap(): TitleTapState {
+		titleTapState ??= installTitleTap();
+		return titleTapState;
+	}
 
 	// ---- title rendering ------------------------------------------------
 
@@ -112,6 +124,8 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), i
 		const title = currentTitle();
 		if (title) {
 			titlePushed = true;
+			// Own the title before writing it, so the tap recognises our own write.
+			titleTap().owned = title;
 			ctx.ui.setTitle(title);
 			return;
 		}
@@ -120,6 +134,8 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), i
 		// stale one does not linger.
 		if (titlePushed) {
 			titlePushed = false;
+			// Back to pi's title: stop defending ours, or the tap would undo this.
+			titleTap().owned = undefined;
 			ctx.ui.setTitle(sessionName ? `π - ${sessionName} - ${path.basename(cwd)}` : `π - ${path.basename(cwd)}`);
 		}
 	}
@@ -547,6 +563,7 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), i
 	});
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
+		if (titleTapState) titleTapState.owned = undefined;
 		if (spinnerTimer) clearInterval(spinnerTimer);
 		spinnerTimer = undefined;
 		detachFocus?.();
