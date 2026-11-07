@@ -1,6 +1,11 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.0] - 2026-11-07
+
+### Added
+
+- The tab stays in the working state while a background job outlives the run. A `process start` job from `@aliou/pi-processes` keeps the spinner turning after `agent_settled` instead of the tab claiming `✓` while a dev server is still running; the `status` slot stays empty until the last job ends, then shows `✓` as before. The producer's process list is re-read on every `processes:changed` event rather than trusting deltas, so a missed event cannot leave a phantom spinner. The bell, the notification and the progress bar are unchanged, and nothing happens when pi-processes is not installed. Upstream has no activity API yet (#10451, #10664, #11702).
+- New `procs` slot: the number of live background jobs, rendered only while at least one runs (`⠹ · 2 · dev-server`). Off by default; add `"procs"` to `ghosttyTab.slots` to use it.
 
 ## [0.2.2] - 2026-10-30
 

@@ -7,7 +7,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-export const SLOT_NAMES = ["status", "spinner", "icon", "dir", "session", "summary", "model", "tool"] as const;
+export const SLOT_NAMES = ["status", "spinner", "icon", "dir", "session", "summary", "model", "tool", "procs"] as const;
 export type SlotName = (typeof SLOT_NAMES)[number];
 
 export type ProgressMode = "auto" | "on" | "off";

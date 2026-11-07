@@ -11,6 +11,7 @@ const FULL_STATE: TitleState = {
 	summary: "Agents.md documentation",
 	model: "k3-256k",
 	tool: "bash",
+	procs: "2",
 };
 
 describe("slotValue", () => {
@@ -23,6 +24,7 @@ describe("slotValue", () => {
 		assert.equal(slotValue("summary", FULL_STATE), "Agents.md documentation");
 		assert.equal(slotValue("model", FULL_STATE), "k3-256k");
 		assert.equal(slotValue("tool", FULL_STATE), "bash");
+		assert.equal(slotValue("procs", FULL_STATE), "2");
 	});
 });
 
