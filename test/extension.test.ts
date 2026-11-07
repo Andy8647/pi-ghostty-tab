@@ -18,6 +18,8 @@ const PROGRESS_PAUSED = "\x1b]9;4;4\x07";
 const PROGRESS_ERROR = "\x1b]9;4;2;100\x07";
 const PROGRESS_DONE = "\x1b]9;4;1;100\x07";
 const PROGRESS_CLEAR = "\x1b]9;4;0\x07";
+/** Any braille frame of the working spinner. */
+const SPINNER = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/;
 
 function useSettings(settings: unknown): void {
 	const dir = mkdtempSync(join(tmpdir(), "pi-ghostty-tab-"));
@@ -37,12 +39,45 @@ async function harness(settings: unknown = {}, opts: { summary?: string } = {}) 
 	const sessionEntries: unknown[] = [];
 	const stdin = Object.assign(new EventEmitter(), { isTTY: true });
 
+	// In-process event bus, plus a stand-in for @aliou/pi-processes: it answers
+	// request:list with whatever background processes the test says are alive.
+	const bus = new EventEmitter();
+	const processes: { id: string; status: string }[] = [];
+	const events = {
+		emit: (channel: string, data: unknown) => {
+			bus.emit(channel, data);
+		},
+		on: (channel: string, handler: (data: unknown) => void) => {
+			bus.on(channel, handler);
+			return () => bus.off(channel, handler);
+		},
+	};
+	events.on("processes:request:list", (payload) => {
+		(payload as { reply: (list: unknown) => void }).reply(processes.map((p) => ({ ...p, name: p.id })));
+	});
+	const bgChanged = () => events.emit("processes:changed", { reason: "changed" });
+	const bgStart = (id = "proc-1") => {
+		processes.push({ id, status: "running" });
+		bgChanged();
+	};
+	const bgEnd = (id = "proc-1") => {
+		const entry = processes.find((p) => p.id === id);
+		if (entry) entry.status = "exited";
+		bgChanged();
+	};
+	const bgForget = (id = "proc-1") => {
+		const index = processes.findIndex((p) => p.id === id);
+		if (index >= 0) processes.splice(index, 1);
+		bgChanged();
+	};
+
 	const pi = {
 		on: (name: string, h: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), h]),
 		registerTool: () => {},
 		registerCommand: (name: string, def: any) => commands.set(name, def),
 		appendEntry: () => {},
 		getSessionName: () => undefined,
+		events,
 	};
 	const ctx = {
 		hasUI: true,
@@ -86,7 +121,26 @@ async function harness(settings: unknown = {}, opts: { summary?: string } = {}) 
 	const lastTitle = () => titles.at(-1);
 	/** Let the fire-and-forget summary promise settle. */
 	const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
-	return { emit, run, writes, titles, lastTitle, stdin, inputListeners, commands, notices, ctx, summaryRequests, flush, sessionEntries };
+	return {
+		emit,
+		run,
+		writes,
+		titles,
+		lastTitle,
+		stdin,
+		inputListeners,
+		commands,
+		notices,
+		ctx,
+		summaryRequests,
+		flush,
+		sessionEntries,
+		bus,
+		processes,
+		bgStart,
+		bgEnd,
+		bgForget,
+	};
 }
 
 const BASE = { ghosttyTab: { slots: ["status", "spinner", "dir"], progress: "on", notifyAfterSeconds: 0 } };
@@ -269,6 +323,78 @@ describe("attention config", () => {
 		await h.emit("session_shutdown");
 		assert.equal(h.stdin.listenerCount("data"), 0);
 		assert.equal(h.inputListeners.length, 0);
+	});
+});
+
+describe("background work", () => {
+	let h: Awaited<ReturnType<typeof harness>>;
+	beforeEach(async () => {
+		h = await harness(BASE);
+		await h.emit("session_start");
+	});
+	afterEach(async () => {
+		await h.emit("session_shutdown");
+	});
+
+	it("keeps working instead of ✓ while a background job outlives the run", async () => {
+		h.stdin.emit("data", FOCUS_OUT);
+		await h.emit("agent_start");
+		h.bgStart();
+		await h.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+		await h.emit("agent_settled");
+
+		assert.ok(h.writes.includes(BEL), "the turn did end: the bell still fires");
+		assert.match(h.lastTitle()!, SPINNER);
+		assert.ok(!h.lastTitle()!.includes("✓"), "a ✓ next to the spinner would contradict it");
+
+		h.bgEnd();
+		assert.equal(h.lastTitle(), "✓ · proj", "the unseen ✓ appears once the job is gone");
+	});
+
+	it("shows working for a job that starts while the agent sits idle", async () => {
+		assert.equal(h.lastTitle(), "proj");
+		h.bgStart();
+		assert.match(h.lastTitle()!, SPINNER);
+		h.bgForget();
+		assert.equal(h.lastTitle(), "proj");
+	});
+
+	it("re-reads the list on a clear instead of assuming nothing runs", async () => {
+		h.bgStart();
+		h.bus.emit("processes:changed", { reason: "cleared" });
+		assert.match(h.lastTitle()!, SPINNER, "a live job survives clearing the finished ones");
+	});
+
+	it("ignores finished jobs in the producer's list", async () => {
+		h.processes.push({ id: "old", status: "exited" });
+		h.bgStart();
+		h.bgEnd();
+		assert.equal(h.lastTitle(), "proj");
+	});
+
+	it("reports the live count in /tab", async () => {		h.bgStart();
+		await h.commands.get("tab")!.handler("", h.ctx);
+		assert.match(h.notices.at(-1)!, /background: 1 live \(pi-processes\)/);
+	});
+
+	it("renders the live count in a procs slot", async () => {
+		const g = await harness({ ghosttyTab: { slots: ["procs", "dir"], progress: "off" } });
+		await g.emit("session_start");
+		assert.equal(g.lastTitle(), "proj", "nothing to count yet");
+		g.bgStart();
+		assert.equal(g.lastTitle(), "1 · proj");
+		g.processes.push({ id: "proc-2", status: "running" });
+		g.bus.emit("processes:changed", { reason: "started" });
+		assert.equal(g.lastTitle(), "2 · proj");
+		g.bgEnd();
+		g.bgForget();
+		assert.equal(g.lastTitle(), "1 · proj");
+		await g.emit("session_shutdown");
+	});
+
+	it("stops following the producer on shutdown", async () => {
+		await h.emit("session_shutdown");
+		assert.equal(h.bus.listenerCount("processes:changed"), 0);
 	});
 });
 

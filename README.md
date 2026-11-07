@@ -39,13 +39,14 @@ The title is a list of **slots** joined by a separator. Configure the list in `~
 | Slot | Shows | When |
 | --- | --- | --- |
 | `status` | `⏸` / `✓` / `✗` | Prompt waiting / finished or failed while you were away (see [Attention](#attention)) |
-| `spinner` | Animated braille frame | Only while the agent is working |
+| `spinner` | Animated braille frame | While the agent works, or a background job it started is still running (see [Background processes](#background-processes)) |
 | `icon` | `π` | Always |
 | `dir` | Working directory basename | Always |
 | `session` | pi session name | When one is set |
 | `summary` | LLM session summary | Once generated or set |
 | `model` | Current model id | Always |
 | `tool` | Name of the executing tool | Only while a tool runs |
+| `procs` | Number of live background jobs, e.g. `2` | While a background job runs (see [Background processes](#background-processes)) |
 
 Rules:
 
@@ -120,6 +121,21 @@ Ghostty's own `notify-on-command-finish` cannot do this for pi: it watches shell
 }
 ```
 
+## Background processes
+
+A `process start` job outlives the turn that started it, and pi still reports the run as finished. Without help the tab would show `✓` while your dev server is still running.
+
+The extension follows [`@aliou/pi-processes`](https://github.com/aliou/pi-processes) over pi's in-process event bus (`pi.events`) and counts the jobs that are alive:
+
+- the spinner keeps turning after `agent_settled`, and the `status` slot stays empty, because a `✓` next to a spinner contradicts itself;
+- the optional `procs` slot shows how many jobs are alive, e.g. `⠹ · 2 · dev-server`;
+- when the last job ends, the `✓` appears as usual if you were away;
+- the progress bar is untouched: it still flashes done and clears with the run.
+
+Every change re-reads the producer's process list instead of trusting start/end deltas, so a missed event cannot leave a phantom spinner behind. Finished processes are ignored, and `process clear` does not release a job that is still alive.
+
+Nothing is tracked when pi-processes is not installed, and nothing changes about the bell or the notification: those still fire when the run settles. pi core has no activity API yet (upstream issues #10451, #10664, #11702), which is why this speaks one producer's protocol rather than a standard one. `/tab` reports `background: N live (pi-processes)`.
+
 ## Progress bar
 
 Ghostty 1.2+ renders a native tab/progress indicator for OSC 9;4: an indeterminate pulse while the agent works, a brief full bar when it finishes, red on failure, orange while a prompt waits. Ghostty drops a progress state after 15 seconds without an update, so held states are re-sent every 5 seconds.
@@ -168,9 +184,10 @@ The extension hooks pi's lifecycle events. The title goes through pi's `ctx.ui.s
 | `model_select` | Update model slot |
 | `agent_start` | Start spinner, indeterminate progress |
 | `tool_execution_start` / `end` | Show / clear the tool slot |
-| `agent_end` | Stop spinner, record the outcome, maybe generate summary |
+| `agent_end` | Stop the spinner, unless a background job is still alive |
 | `agent_settled` | Run is really over (no retry/compaction left): progress flash, `✓`/`✗`, bell + notification |
 | `ui_prompt_start` / `end` | `⏸` + paused bar while a prompt waits; bell + notification if unfocused |
+| `pi.events` `processes:changed` | Re-read the live background jobs; keeps the spinner up across a settle |
 | `session_shutdown` | Clear progress bar, detach focus tracking |
 
 ## License

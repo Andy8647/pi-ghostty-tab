@@ -28,6 +28,7 @@ import {
 	settleDecision,
 	statusGlyph,
 } from "./attention.ts";
+import { type BackgroundTracker, trackBackgroundWork } from "./background.ts";
 import { loadConfig, progressEnabled, type LoadedConfig } from "./config.ts";
 import { createTtyWriter, ProgressState, progressSequence, type WriteFn } from "./progress.ts";
 import { assistantText, buildSummaryUserPrompt, sanitizeSummary, SUMMARY_SYSTEM_PROMPT } from "./summary.ts";
@@ -62,7 +63,12 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), i
 	let sessionName: string | undefined;
 	let summary: string | undefined;
 	let cwd = process.cwd();
+	/** A run is in flight, i.e. between agent_start and agent_end. */
+	let runWorking = false;
+	/** Rendered as "working": a run in flight, or background work somebody else is still running. */
 	let isWorking = false;
+	/** Live background jobs reported over `pi.events`; undefined when nothing is tracking them. */
+	let background: BackgroundTracker | undefined;
 	let currentTool: string | undefined;
 	let frameIndex = 0;
 	let spinnerTimer: ReturnType<typeof setInterval> | undefined;
@@ -102,9 +108,16 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), i
 
 	// ---- title rendering ------------------------------------------------
 
+	function backgroundCount(): number {
+		return background?.tasks.count ?? 0;
+	}
+
 	function titleState(): TitleState {
+		// A ✓ while a background job is still alive would contradict the spinner next to it.
+		const live = backgroundCount();
+		const backgroundOnly = !runWorking && live > 0;
 		return {
-			status: statusGlyph(attention),
+			status: backgroundOnly ? undefined : statusGlyph(attention),
 			spinnerFrame: isWorking && attention !== "waiting" ? BRAILLE_FRAMES[frameIndex % BRAILLE_FRAMES.length] : undefined,
 			icon: "π",
 			dir: path.basename(cwd),
@@ -112,6 +125,7 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), i
 			summary,
 			model: currentModel,
 			tool: currentTool,
+			procs: live > 0 ? String(live) : undefined,
 		};
 	}
 
@@ -169,27 +183,33 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), i
 
 	// ---- spinner -----------------------------------------------------------
 
-	function startSpinner(ctx: ExtensionContext): void {
-		if (spinnerTimer) clearInterval(spinnerTimer);
-		isWorking = true;
-		currentTool = undefined;
-		frameIndex = 0;
-		spinnerTimer = setInterval(() => {
-			// A waiting tab shows ⏸ instead of a spinner; nothing to animate.
-			if (attention === "waiting") return;
-			frameIndex++;
-			renderTitle(ctx);
-		}, SPINNER_INTERVAL_MS);
-	}
-
-	function stopSpinner(ctx: ExtensionContext): void {
-		isWorking = false;
-		currentTool = undefined;
-		if (spinnerTimer) {
-			clearInterval(spinnerTimer);
-			spinnerTimer = undefined;
+	/**
+	 * One animation for every kind of busy: the agent's run and other extensions'
+	 * background jobs share it, so the spinner keeps turning across a settle when
+	 * a background job outlives the turn.
+	 */
+	function syncActivity(ctx: ExtensionContext): void {
+		isWorking = runWorking || backgroundCount() > 0;
+		if (isWorking && !spinnerTimer) {
+			frameIndex = 0;
+			spinnerTimer = setInterval(() => {
+				// A waiting tab shows ⏸ instead of a spinner; nothing to animate.
+				if (attention === "waiting" || !lastCtx) return;
+				frameIndex++;
+				renderTitle(lastCtx);
+			}, SPINNER_INTERVAL_MS);
+		} else if (!isWorking) {
+			currentTool = undefined;
+			if (spinnerTimer) {
+				clearInterval(spinnerTimer);
+				spinnerTimer = undefined;
+			}
 		}
 		renderTitle(ctx);
+	}
+
+	function onBackgroundChange(): void {
+		if (lastCtx) syncActivity(lastCtx);
 	}
 
 	// ---- attention ---------------------------------------------------------
@@ -404,6 +424,7 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), i
 						`summary: ${summary ?? "(none)"}`,
 						`progress: ${config.progress}${config.progress === "auto" ? (progressOn ? " (auto: ours)" : " (auto: pi core)") : ""}`,
 						`attention: ${attention ?? "(none)"} · focused: ${focused} · tracking: ${detachFocus ? "on" : "off"}`,
+						`background: ${backgroundCount()} live${background ? " (pi-processes)" : " (not tracking)"}`,
 						`bell: ${config.bell} · notify: ${config.notify} · notifyAfterSeconds: ${config.notifyAfterSeconds}`,
 					].join("\n"),
 					"info",
@@ -464,6 +485,9 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), i
 		attention = undefined;
 		restoreSummary(ctx);
 		attachFocus(ctx);
+		background?.dispose();
+		background = trackBackgroundWork(pi.events, onBackgroundChange);
+		runWorking = false;
 		renderTitle(ctx);
 		if (!warningsNotified && loaded.warnings.length > 0) {
 			warningsNotified = true;
@@ -498,7 +522,9 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), i
 		// An external editor or ctrl+z may have reset focus reporting.
 		if (detachFocus) write(ENABLE_FOCUS_REPORTING);
 		if (attention !== "waiting") setProgress(ProgressState.Indeterminate);
-		startSpinner(ctx);
+		runWorking = true;
+		currentTool = undefined;
+		syncActivity(ctx);
 	});
 
 	// The first user message is the earliest point where the task text exists.
@@ -518,7 +544,9 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), i
 		lastCtx = ctx;
 		if (!ctx.hasUI) return;
 		lastOutcome = runOutcome(event.messages, runSignal?.aborted === true);
-		stopSpinner(ctx);
+		// Background jobs may outlive the turn: syncActivity keeps the spinner up if any do.
+		runWorking = false;
+		syncActivity(ctx);
 		// Fallback: retry here if the message_start attempt failed or the run
 		// started without a visible user message.
 		void generateSummary(ctx);
@@ -566,6 +594,9 @@ export default function (pi: ExtensionAPI, write: WriteFn = createTtyWriter(), i
 		if (titleTapState) titleTapState.owned = undefined;
 		if (spinnerTimer) clearInterval(spinnerTimer);
 		spinnerTimer = undefined;
+		background?.dispose();
+		background = undefined;
+		runWorking = false;
 		detachFocus?.();
 		if (progressOn) setProgress(ProgressState.Clear);
 		runActive = false;

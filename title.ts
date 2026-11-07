@@ -22,6 +22,8 @@ export interface TitleState {
 	model?: string;
 	/** Name of the tool currently executing; undefined when no tool runs. */
 	tool?: string;
+	/** Live background job count; undefined when nothing runs in the background. */
+	procs?: string;
 }
 
 export function slotValue(slot: SlotName, state: TitleState): string | undefined {
@@ -42,6 +44,8 @@ export function slotValue(slot: SlotName, state: TitleState): string | undefined
 			return state.model;
 		case "tool":
 			return state.tool;
+		case "procs":
+			return state.procs;
 	}
 }
 
